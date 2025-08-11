@@ -1,8 +1,22 @@
+/**
+ * Steam OpenID provider for Auth.js (NextAuth.js v5 style).
+ *
+ * This module exposes a factory `SteamProvider()` that returns an `OAuthConfig` configured
+ * to perform OpenID 2.0 authentication against Steam. It also includes an internal
+ * `verifyAssertion()` helper to validate Steam's OpenID response in a framework-agnostic way.
+ */
 import { OAuthConfig } from "next-auth/providers"
 import { SteamProfile, SteamProviderOptions } from "./types/steam"
 import { AUTHORIZATION_URL, EMAIL_DOMAIN, LOGO_URL, PROVIDER_ID, PROVIDER_NAME } from "./constants/steam"
 
 
+/**
+ * Creates a Steam provider configuration for Auth.js.
+ *
+ * - `req` is the incoming request (used to read the callback query when Steam redirects back).
+ * - `options.clientSecret` must be your Steam Web API Key.
+ * - `options.callbackUrl` must point to your Auth callback base URL (e.g. `https://site.com/api/auth/callback`).
+ */
 export default function SteamProvider(
   req: Request,
   options: SteamProviderOptions
@@ -10,8 +24,11 @@ export default function SteamProvider(
   if (!options.clientSecret || options.clientSecret.length < 1)
     throw new Error('You have forgot to set your Steam API Key in the `clientSecret` option. Please visit https://steamcommunity.com/dev/apikey to get one.')
   
+  // Build OpenID realm and return_to. OpenID 2.0 requires both.
+  // realm: the base origin expected by the RP (your site)
   const callbackUrl = new URL(options.callbackUrl)
   const realm = callbackUrl.origin
+  // return_to: the exact URL Steam will redirect back to after auth
   const returnTo = `${callbackUrl.href}/${PROVIDER_ID}`
   
   return {
@@ -25,6 +42,7 @@ export default function SteamProvider(
       bg: '#000',
       text: '#fff',
     },
+    // OpenID 2.0 does not support PKCE/state like modern OAuth2; Auth.js checks are disabled here.
     checks: ['none'],
     authorization: {
       url: AUTHORIZATION_URL,
@@ -49,6 +67,8 @@ export default function SteamProvider(
         if (!identifier) {
           throw new Error('Unauthenticated')
         }
+        // Respond with a pseudo access token and the extracted steamId.
+        // Auth.js will pass this through to `userinfo.request` below.
         return Response.json({
           // id_token: globalThis.crypto.randomUUID(),
           access_token: globalThis.crypto.randomUUID(),
@@ -62,6 +82,7 @@ export default function SteamProvider(
       url: `${callbackUrl}/steam`,
       async request(ctx:any) {
         try {
+          // Fetch public profile from Steam Web API using the steamId obtained above.
           const url = new URL('https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002')
           url.searchParams.set('key', ctx.provider.clientSecret as string)
           url.searchParams.set('steamids', ctx.tokens.steamId as string)
@@ -81,7 +102,8 @@ export default function SteamProvider(
       }
     },
     profile(profile: SteamProfile) {
-      // next.js can't serialize the session if email is missing or null, so I specify user ID
+      // Next.js can't serialize the session if email is missing/null.
+      // Provide a synthetic email derived from steamid to satisfy Auth.js constraints.
       return {
         id: profile.steamid,
         image: profile.avatarfull,
@@ -93,7 +115,9 @@ export default function SteamProvider(
 }
 
 /**
- * Verifies an assertion and returns the claimed identifier if authenticated, otherwise null.
+ * Validates Steam's OpenID 2.0 assertion and extracts the SteamID64.
+ *
+ * Returns the numeric SteamID (as string) when the assertion is valid, otherwise `null`.
  */
 async function verifyAssertion(
   req: Request,
