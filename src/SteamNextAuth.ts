@@ -1,14 +1,10 @@
-import { randomUUID } from "crypto"
-import { NextApiRequest } from "next"
 import { OAuthConfig } from "next-auth/providers"
-import { NextRequest } from "next/server"
-import { RelyingParty } from 'openid'
 import { SteamProfile, SteamProviderOptions } from "./types/steam"
 import { AUTHORIZATION_URL, EMAIL_DOMAIN, LOGO_URL, PROVIDER_ID, PROVIDER_NAME } from "./constants/steam"
 
 
 export default function SteamProvider(
-  req: Request | NextRequest | NextApiRequest,
+  req: Request,
   options: SteamProviderOptions
 ): OAuthConfig<SteamProfile> {
   if (!options.clientSecret || options.clientSecret.length < 1)
@@ -44,7 +40,6 @@ export default function SteamProvider(
     token: {
       url: `${callbackUrl}/steam`,
       async conform() {
-        console.log('RUN token');
         if (!req.url) {
           throw new Error('No URL found in request object')
         }
@@ -55,8 +50,8 @@ export default function SteamProvider(
           throw new Error('Unauthenticated')
         }
         return Response.json({
-          // id_token: randomUUID(),
-          access_token: randomUUID(),
+          // id_token: globalThis.crypto.randomUUID(),
+          access_token: globalThis.crypto.randomUUID(),
           steamId: identifier,
           token_type: 'Bearer'
         })
@@ -66,14 +61,23 @@ export default function SteamProvider(
     userinfo: {
       url: `${callbackUrl}/steam`,
       async request(ctx:any) {
-        const url = new URL('https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002')
+        try {
+          const url = new URL('https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002')
+          url.searchParams.set('key', ctx.provider.clientSecret as string)
+          url.searchParams.set('steamids', ctx.tokens.steamId as string)
 
-        url.searchParams.set('key', ctx.provider.clientSecret as string)
-        url.searchParams.set('steamids', ctx.tokens.steamId as string)
-
-        const response = await fetch(url)
-        const data = await response.json()
-        return data.response.players[0]
+          const response = await fetch(url)
+          if (!response.ok) {
+            throw new Error(`Steam API error: ${response.status} ${response.statusText}`)
+          }
+          const data = await response.json()
+          if (!data?.response?.players?.[0]) {
+            throw new Error('Steam profile not found')
+          }
+          return data.response.players[0]
+        } catch (err) {
+          throw new Error(`Failed to fetch Steam user info: ${(err as Error).message}`)
+        }
       }
     },
     profile(profile: SteamProfile) {
@@ -92,12 +96,11 @@ export default function SteamProvider(
  * Verifies an assertion and returns the claimed identifier if authenticated, otherwise null.
  */
 async function verifyAssertion(
-  req: Request | NextRequest | NextApiRequest,
+  req: Request,
   realm: string,
   returnTo: string
 ): Promise<string | null> {
-  // Here and from here on out, much of the validation will be related to this PR: https://github.com/liamcurry/passport-steam/pull/120.
-  // And accordingly copy the logic from this library: https://github.com/liamcurry/passport-steam/blob/dcebba52d02ce2a12c7d27481490c4ee0bd1ae38/lib/passport-steam/strategy.js#L93
+  // Validation based on passport-steam logic
   const IDENTIFIER_PATTERN = /^https?:\/\/steamcommunity\.com\/openid\/id\/(\d+)$/
   const OPENID_CHECK = {
     ns: 'http://specs.openid.net/auth/2.0',
@@ -105,47 +108,46 @@ async function verifyAssertion(
     identity: 'https://steamcommunity.com/openid/id/'
   }
 
-  // We need to create a new URL object to parse the query string
-  // req.url in next@14 is an absolute url, but not in next@13, so example.com used as a base url
   const url = new URL(req.url!, 'https://example.com')
-  const query = Object.fromEntries(url.searchParams.entries())
+  const params = new URLSearchParams(url.search)
 
-  if (query['openid.op_endpoint'] !== AUTHORIZATION_URL || query['openid.ns'] !== OPENID_CHECK.ns) {
+  if (params.get('openid.op_endpoint') !== AUTHORIZATION_URL || params.get('openid.ns') !== OPENID_CHECK.ns) {
+    return null
+  }
+  const claimed = params.get('openid.claimed_id') || ''
+  const identity = params.get('openid.identity') || ''
+  if (!claimed.startsWith(OPENID_CHECK.claimed_id)) {
+    return null
+  }
+  if (!identity.startsWith(OPENID_CHECK.identity)) {
+    return null
+  }
+  // Optional: ensure return_to and realm match what we expect
+  if (params.get('openid.return_to') !== returnTo) {
     return null
   }
 
-  if (!query['openid.claimed_id']?.startsWith(OPENID_CHECK.claimed_id)) {
-    return null
+  // Build verification payload: same params but with mode=check_authentication
+  const verifyParams = new URLSearchParams()
+  for (const [k, v] of params.entries()) {
+    if (k === 'openid.mode') continue
+    verifyParams.set(k, v)
   }
+  verifyParams.set('openid.mode', 'check_authentication')
 
-  if (!query['openid.identity']?.startsWith(OPENID_CHECK.identity)) {
-    return null
-  }
-
-  const relyingParty = new RelyingParty(returnTo, realm, true, false, [])
-
-  const assertion: {
-    authenticated: boolean
-    claimedIdentifier?: string | undefined
-  } = await new Promise((resolve, reject) => {
-    relyingParty.verifyAssertion(req, (error, result) => {
-      if (error) {
-        reject(error)
-      }
-
-      resolve(result!)
-    })
+  const resp = await fetch(AUTHORIZATION_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: verifyParams.toString(),
+    // Edge friendly; no Node-specific options
   })
+  if (!resp.ok) return null
+  const text = await resp.text()
+  // Response lines like: ns:...\nis_valid:true
+  const isValid = /is_valid\s*:\s*true/i.test(text)
+  if (!isValid) return null
 
-  if (!assertion.authenticated || !assertion.claimedIdentifier) {
-    return null
-  }
-
-  const match = assertion.claimedIdentifier.match(IDENTIFIER_PATTERN)
-
-  if (!match) {
-    return null
-  }
-
+  const match = claimed.match(IDENTIFIER_PATTERN)
+  if (!match) return null
   return match[1]
 }
